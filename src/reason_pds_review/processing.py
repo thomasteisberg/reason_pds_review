@@ -2,7 +2,8 @@
 
 import numpy as np
 import xarray as xr
-from typing import Union
+from typing import Union, Optional
+from scipy import signal
 
 
 def apply_stacking(data: Union[np.ndarray, xr.DataArray],
@@ -167,3 +168,250 @@ def calculate_amplitude_db(complex_data: Union[np.ndarray, xr.DataArray],
         return result
     else:
         return amplitude_db
+
+
+def generate_chirp(chirp_start_freq: float,
+                   chirp_end_freq: float,
+                   chirp_length_ticks: int,
+                   sample_rate: float,
+                   window: str = 'hann') -> np.ndarray:
+    """
+    Generate a complex reference chirp for pulse compression.
+
+    The chirp is centered at zero frequency (complex baseband) and spans
+    the specified bandwidth with optional windowing to suppress range sidelobes.
+
+    Parameters
+    ----------
+    chirp_start_freq : float
+        Starting frequency of the chirp in Hz
+    chirp_end_freq : float
+        Ending frequency of the chirp in Hz
+    chirp_length_ticks : int
+        Duration of the chirp in sample ticks
+    sample_rate : float
+        Sample rate in Hz
+    window : str, optional
+        Window function to apply ('hann', 'hamming', 'blackman', or None).
+        Default is 'hann' to suppress range sidelobes.
+
+    Returns
+    -------
+    np.ndarray
+        Complex reference chirp signal
+
+    Examples
+    --------
+    >>> # Generate HF chirp from engineering data
+    >>> chirp = generate_chirp(
+    ...     chirp_start_freq=chirp_start[0],
+    ...     chirp_end_freq=chirp_end[0],
+    ...     chirp_length_ticks=chirp_length[0],
+    ...     sample_rate=1.2e6
+    ... )
+
+    Notes
+    -----
+    The chirp is complex baseband, spanning the bandwidth centered on zero.
+    Windowing (e.g., Hann) suppresses range sidelobes at the cost of slight
+    range resolution degradation.
+    """
+    # Calculate bandwidth and center frequency (baseband, so center = 0)
+    bandwidth = chirp_end_freq - chirp_start_freq
+    f0 = -bandwidth / 2  # Start at -BW/2 for baseband centered at 0
+    f1 = bandwidth / 2   # End at +BW/2
+
+    # Convert chirp length from ticks to seconds
+    duration_sec = chirp_length_ticks / 48e6  # Ticks are from a 48 MHz clock, as inferred from Table B1
+    duration_samples = int(duration_sec * sample_rate)
+
+    # Time vector for the chirp
+    t = np.linspace(0, duration_sec, duration_samples)
+
+    # Generate complex linear chirp
+    chirp_complex = signal.chirp(t, f0=f0, f1=f1, t1=t[-1], method='linear', phi=0, complex=True)
+
+    # Apply window to suppress sidelobes
+    if window is not None and window.lower() != 'none':
+        if window.lower() == 'hann':
+            win = np.hanning(len(t))
+        elif window.lower() == 'hamming':
+            win = np.hamming(len(t))
+        elif window.lower() == 'blackman':
+            win = np.blackman(len(t))
+        else:
+            raise ValueError(f"Unknown window type: {window}")
+
+        chirp_complex = chirp_complex * win
+
+    return chirp_complex
+
+
+def pulse_compress(data: np.ndarray,
+                   chirp: np.ndarray,
+                   axis: int = -1) -> np.ndarray:
+    """
+    Apply pulse compression via matched filter
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Complex radar data to compress. Typically shape (slow_time, fast_time).
+    chirp : np.ndarray
+        Complex reference chirp signal from generate_chirp()
+    axis : int, optional
+        Axis along which to apply compression (default: -1, fast time axis)
+
+    Returns
+    -------
+    np.ndarray
+        Pulse-compressed complex data with same shape as input
+
+    Examples
+    --------
+    >>> # Compress a single record
+    >>> chirp = generate_chirp(chirp_start, chirp_end, chirp_len, sample_rate)
+    >>> compressed = pulse_compress(raw_data, chirp, axis=1)
+    """
+
+    # Apply cross-correlation along specified axis
+    # Use 'same' mode to maintain input length
+    compressed = np.apply_along_axis(
+        lambda m: signal.correlate(m, chirp, mode='same'),
+        axis=axis,
+        arr=data
+    )
+
+    return compressed
+
+
+def align_by_delay(data: np.ndarray,
+                   hw_rx_opening_ticks: np.ndarray,
+                   tx_start_ticks: np.ndarray,
+                   chirp_length_ticks: np.ndarray,
+                   rx_window_length_ticks: np.ndarray,
+                   raw_active_mode_length: np.ndarray,
+                   axis: int = 0) -> np.ndarray:
+    """
+    Align fast time records by rolling to account for varying delays.
+
+    In the Partially Processed Data Product, dwell delays are varied to maintain
+    tracking of the surface. This function aligns records by computing the delay
+    offset and rolling each fast time record accordingly.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Complex radar data, typically shape (slow_time, fast_time)
+    hw_rx_opening_ticks : np.ndarray
+        Hardware RX opening time in ticks for each pulse (slow_time,)
+    tx_start_ticks : np.ndarray
+        TX start time in ticks for each pulse (slow_time,)
+    chirp_length_ticks : np.ndarray
+        Chirp length in ticks for each pulse (slow_time,)
+    rx_window_length_ticks : np.ndarray
+        RX window length in ticks for each pulse (slow_time,)
+    raw_active_mode_length : np.ndarray
+        Raw active mode length (number of fast time samples) for each pulse
+    axis : int, optional
+        Axis corresponding to slow time (default: 0)
+
+    Returns
+    -------
+    np.ndarray
+        Aligned radar data with same shape as input
+
+    Notes
+    -----
+    The delay between transmit pulse and receive window start is:
+        delay_ticks = (hw_rx_opening_ticks - tx_start_ticks) + chirp_length_ticks
+
+    This is converted to samples using the sample rate derived from:
+        sample_rate = raw_active_mode_length / rx_window_length_ticks
+
+    Each fast time record is then rolled by the computed sample offset.
+    """
+    aligned_data = data.copy()
+
+    # Calculate delay in ticks for each pulse
+    delay_ticks = (hw_rx_opening_ticks - tx_start_ticks) + chirp_length_ticks
+
+    # Convert to samples
+    # Sample rate = raw_active_mode_length / rx_window_length_ticks
+    delay_samples = delay_ticks * (raw_active_mode_length / rx_window_length_ticks)
+
+    # Compute roll amounts relative to first pulse
+    reference_delay = delay_samples[0]
+    roll_amounts = np.round(delay_samples - reference_delay).astype(int)
+
+    # Roll each fast time record
+    for i in range(aligned_data.shape[axis]):
+        if axis == 0:
+            aligned_data[i, :] = np.roll(aligned_data[i, :], -roll_amounts[i])
+        elif axis == 1:
+            aligned_data[:, i] = np.roll(aligned_data[:, i], -roll_amounts[i])
+        else:
+            raise ValueError("axis must be 0 or 1 for 2D data")
+
+    return aligned_data
+
+
+def geometric_correction(data: np.ndarray,
+                        altitude_km: np.ndarray,
+                        sample_rate: float,
+                        axis: int = 0) -> np.ndarray:
+    """
+    Apply geometric correction by aligning records to reference ellipsoid range.
+
+    Uses spacecraft altitude to compute range to reference ellipsoid and rolls
+    each fast time record to align surface returns geometrically.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Complex radar data, typically shape (slow_time, fast_time)
+    altitude_km : np.ndarray
+        Spacecraft altitude above target ellipsoid in km (slow_time,)
+    sample_rate : float
+        Sample rate in Hz
+    axis : int, optional
+        Axis corresponding to slow time (default: 0)
+
+    Returns
+    -------
+    np.ndarray
+        Geometrically corrected radar data with same shape as input
+
+    Notes
+    -----
+    Range to ellipsoid is computed using two-way speed of light:
+        range_samples = (2 * altitude_km * 1000) / (c / sample_rate)
+    where c = 299792458 m/s (speed of light in vacuum)
+
+    For subsurface analysis, use speed of light in ice (~169 m/µs).
+    Each record is rolled to align the surface return.
+    """
+    c = 299792458  # Speed of light in m/s
+
+    corrected_data = data.copy()
+
+    # Calculate two-way range in samples
+    # altitude_km * 1000 = altitude in meters
+    # Two-way distance = 2 * altitude
+    # Sample distance = c / sample_rate
+    range_samples = (2 * altitude_km * 1000) / (c / sample_rate)
+
+    # Compute roll amounts relative to first pulse
+    reference_range = range_samples[0]
+    roll_amounts = np.round(range_samples - reference_range).astype(int)
+
+    # Roll each fast time record
+    for i in range(corrected_data.shape[axis]):
+        if axis == 0:
+            corrected_data[i, :] = np.roll(corrected_data[i, :], -roll_amounts[i])
+        elif axis == 1:
+            corrected_data[:, i] = np.roll(corrected_data[:, i], -roll_amounts[i])
+        else:
+            raise ValueError("axis must be 0 or 1 for 2D data")
+
+    return corrected_data

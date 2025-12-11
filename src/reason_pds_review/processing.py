@@ -291,7 +291,6 @@ def align_by_delay(data: np.ndarray,
                    chirp_length_ticks: np.ndarray,
                    rx_window_length_ticks: np.ndarray,
                    raw_active_mode_length: np.ndarray,
-                   sample_rate: float,
                    axis: int = 0) -> np.ndarray:
     """
     Align fast time records by rolling to account for varying delays.
@@ -337,9 +336,6 @@ def align_by_delay(data: np.ndarray,
     # Calculate delay in ticks for each pulse
     delay_ticks = (hw_rx_opening_ticks - tx_start_ticks) + chirp_length_ticks
 
-    delay_times = delay_ticks / 48e6  # Convert ticks to seconds (assuming 48 MHz clock)
-    delay_samples = delay_times * sample_rate
-
     # TODO: Documentation says:
     # The delay between the transmit pulse and the start of the receive window is
     # (ENG:HW_RX_opening_ticks - ENG:TX_start_ticks), and offsets resulting from the
@@ -348,10 +344,11 @@ def align_by_delay(data: np.ndarray,
     # (ENG:raw_active_mode_length/ENG:RX_window_length_ticks), you can roll each fast
     # time record array to align.
 
-    # TODO: Old version -- this didn't work either
-    # # Convert to samples
-    # # Sample rate = raw_active_mode_length / rx_window_length_ticks
-    # delay_samples = delay_ticks * (raw_active_mode_length / rx_window_length_ticks)
+    # I believe I'm still missing some correction factor that varies by dwell here, but
+    # I haven't been able to figure out what.
+
+    sample_rate = raw_active_mode_length / rx_window_length_ticks
+    delay_samples = delay_ticks * sample_rate
 
     # Compute roll amounts relative to first pulse
     reference_delay = delay_samples[0]

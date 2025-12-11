@@ -132,6 +132,12 @@ def process_channel(channel_name, science_ds, eng_ds, med_ds, sample_rate, stack
                     # Take first value of each stack window
                     dwell_eng = eng_ds[key].values[dwell_indices]
                     eng_stacked[key] = dwell_eng[::stack_factor][:stacked.shape[0]]
+            # Stack med data
+            if med_ds is not None:
+                med_stacked = {}
+                for key in med_ds.data_vars:
+                    dwell_med = med_ds[key].values[dwell_indices]
+                    med_stacked[key] = dwell_med[::stack_factor][:stacked.shape[0]]
         else:
             stacked = compressed
             eng_stacked = {}
@@ -139,26 +145,25 @@ def process_channel(channel_name, science_ds, eng_ds, med_ds, sample_rate, stack
                         'RX_window_length_ticks', 'Raw_active_mode_length']:
                 if key in eng_ds.data_vars:
                     eng_stacked[key] = eng_ds[key].values[dwell_indices]
+            med_stacked = {}
+            if med_ds is not None:
+                for key in med_ds.data_vars:
+                    med_stacked[key] = med_ds[key].values[dwell_indices]
 
         # Step 4: Align records within dwell by delay
-        # TODO: I couldn't get this to work. See notes in align_by_delay
-        # try:
-        #     aligned = align_by_delay(
-        #         data=stacked,
-        #         hw_rx_opening_ticks=eng_stacked['HW_RX_opening_ticks'],
-        #         tx_start_ticks=eng_stacked['TX_start_ticks'],
-        #         chirp_length_ticks=eng_stacked['Chirp_length_ticks'],
-        #         rx_window_length_ticks=eng_stacked['RX_window_length_ticks'],
-        #         raw_active_mode_length=eng_stacked['Raw_active_mode_length'],
-        #         sample_rate=sample_rate,
-        #         axis=0
-        #     )
-        # except Exception as e:
-        #     print(f"    Warning: Delay alignment failed for dwell {dwell_id}: {e}")
-        #     aligned = stacked
+        # TODO: I'm still missing some correction factor. See notes in align_by_delay
+        
+        aligned = align_by_delay(
+            data=stacked,
+            hw_rx_opening_ticks=eng_stacked['HW_RX_opening_ticks'],
+            tx_start_ticks=eng_stacked['TX_start_ticks'],
+            chirp_length_ticks=eng_stacked['Chirp_length_ticks'],
+            rx_window_length_ticks=eng_stacked['RX_window_length_ticks'],
+            raw_active_mode_length=eng_stacked['Raw_active_mode_length'],
+            axis=0
+        )
 
-        #dwell_results.append(aligned)
-        dwell_results.append(stacked)
+        dwell_results.append(aligned)
 
     # Concatenate all dwells
     print(f"  Concatenating {len(dwell_results)} dwells...")
@@ -167,7 +172,7 @@ def process_channel(channel_name, science_ds, eng_ds, med_ds, sample_rate, stack
 
     # Step 5: Geometric correction (align to reference altitude)
     # Shift all records to a common reference altitude using MED data
-    if False and med_ds is not None and 'SC_altitude_above_target_ellipsoid' in med_ds.data_vars:
+    if med_ds is not None and 'SC_altitude_above_target_ellipsoid' in med_ds.data_vars:
         print(f"  Applying geometric correction...")
 
         # Get altitude data (in meters)
@@ -183,12 +188,8 @@ def process_channel(channel_name, science_ds, eng_ds, med_ds, sample_rate, stack
         # Convert to km
         altitude_km = altitude_stacked / 1000.0
 
-        # Reference altitude for alignment
-        # This aligns the top of the radargram to 3398 km altitude
-        reference_altitude_km = 3398.0
-
         print(f"    Altitude range: {altitude_km.min():.1f} to {altitude_km.max():.1f} km")
-        print(f"    Reference altitude: {reference_altitude_km:.1f} km")
+        
 
         # Apply geometric correction using the library function
         geometrically_corrected = geometric_correction(
@@ -198,6 +199,11 @@ def process_channel(channel_name, science_ds, eng_ds, med_ds, sample_rate, stack
             axis=0
         )
 
+        # # Reference altitude for alignment
+        # # This aligns the top of the radargram to 3398 km altitude
+        # reference_altitude_km = 3398.0
+        # print(f"    Reference altitude: {reference_altitude_km:.1f} km")
+        #
         # # Now shift to reference altitude
         # # Calculate additional shift needed to align to reference altitude
         # mean_altitude = altitude_km.mean()

@@ -371,6 +371,8 @@ def load_ppdp(data_dir: str) -> xr.DataTree:
             channels_data[channel_name]['engineering'] = _load_engineering_data(file_path)
 
     # Load mission engineering data (MED) files (*MED*.TAB files)
+    vhf_comb_med = None  # Shared VHF MED data for all VHF channels
+
     for file_path in sorted(data_path.glob('*MED*.TAB')):
         parsed = _parse_filename(file_path.name)
         if not parsed:
@@ -384,6 +386,11 @@ def load_ppdp(data_dir: str) -> xr.DataTree:
             channel_name = 'HF'
         elif '60TFULL' in channel_key.upper():
             channel_name = 'VHF_FULL'
+        elif '60TCOMB' in channel_key.upper():
+            # This is shared VHF MED data - load it once and share with all VHF channels
+            print(f"Loading VHF combined mission engineering data from {file_path.name}...")
+            vhf_comb_med = _load_engineering_data(file_path, is_med=True)
+            continue  # Don't assign yet, will share later
         elif 'NEGX' in channel_key.upper():
             channel_name = 'VHF_NEGX'
         elif 'POSX' in channel_key.upper():
@@ -392,6 +399,13 @@ def load_ppdp(data_dir: str) -> xr.DataTree:
         if channel_name and channel_name in channels_data:
             print(f"Loading {channel_name} mission engineering data from {file_path.name}...")
             channels_data[channel_name]['med'] = _load_engineering_data(file_path, is_med=True)
+
+    # Share VHF combined MED data with any VHF channels that don't have their own MED
+    if vhf_comb_med is not None:
+        for channel_name in ['VHF_POSX', 'VHF_NEGX', 'VHF_FULL']:
+            if channel_name in channels_data and 'med' not in channels_data[channel_name]:
+                print(f"Using VHF combined MED data for {channel_name}...")
+                channels_data[channel_name]['med'] = vhf_comb_med
 
     # Build DataTree structure using from_dict
     tree_dict = {}

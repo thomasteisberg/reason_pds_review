@@ -191,28 +191,65 @@ def _load_science_data(file_path: Path, channel_config: Dict) -> xr.Dataset:
     return ds
 
 
-def _load_engineering_data(file_path: Path) -> xr.Dataset:
+def _load_engineering_data(file_path: Path, is_med: bool = False) -> xr.Dataset:
     """
     Load engineering data from .TAB file into xarray Dataset.
 
     Args:
         file_path: Path to .TAB file
+        is_med: If True, only load scalar columns (MED files have many vector columns)
 
     Returns:
         xarray Dataset with engineering parameters
     """
     # Read TAB file (tab-delimited)
-    df = pd.read_csv(file_path, sep='\t')
+    if is_med:
+        # For MED files, load all columns first then select important ones
+        # (using usecols causes column misalignment issues)
+        # Force index_col=False to prevent pandas from auto-detecting an index
+        df = pd.read_csv(file_path, sep='\t', low_memory=False, index_col=False)
 
-    # Convert to xarray Dataset with record dimension
-    ds = xr.Dataset.from_dataframe(df)
+        # Define important scalar columns to keep from MED files
+        # Skip vector columns (positions, velocities, etc. which are arrays)
+        important_cols = [
+            'Ephemeris_time', 'SC_clock', 'UTC_doy', 'UTC_yymmdd',
+            'SC_altitude_above_target_ellipsoid', 'SC_distance_from_target_center',
+            'SC_latitude', 'SC_longitude_PE', 'SC_longitude_PW',
+            'Jup_sc_distance', 'Europa_sc_distance',
+            'Time_from_ca', 'Receive_time_offset',
+            'Solar_zenith_angle', 'Jupiter_zenith_angle'
+        ]
+
+        # Only keep columns that exist in the dataframe
+        keep_cols = [col for col in important_cols if col in df.columns]
+        df = df[keep_cols]
+
+        # Convert to xarray manually to avoid from_dataframe issues with object columns
+        data_vars = {}
+        for col in df.columns:
+            data_vars[col] = (['slow_time'], df[col].values)
+
+        ds = xr.Dataset(
+            data_vars=data_vars,
+            coords={'slow_time': np.arange(len(df))}
+        )
+    else:
+        # For engineering files, load all columns (they're smaller)
+        df = pd.read_csv(file_path, sep='\t')
+
+        # Convert to xarray Dataset with record dimension
+        ds = xr.Dataset.from_dataframe(df)
 
     # Rename index to slow_time to match science data
     if 'index' in ds.dims:
         ds = ds.rename({'index': 'slow_time'})
 
-    ds.attrs['source_file'] = file_path.name
-    ds.attrs['description'] = 'Engineering data (chirp parameters, telemetry)'
+    if is_med:
+        ds.attrs['source_file'] = file_path.name
+        ds.attrs['description'] = 'Mission engineering data (altitude, position, timing)'
+    else:
+        ds.attrs['source_file'] = file_path.name
+        ds.attrs['description'] = 'Engineering data (chirp parameters, telemetry)'
 
     return ds
 
@@ -222,7 +259,7 @@ def load_ppdp(data_dir: str) -> xr.DataTree:
     Load REASON partially processed data from a directory into an xarray DataTree.
 
     This function scans a partially processed data directory and loads all .BIN
-    (science data) and .TAB (engineering data) files, organizing them into a
+    (science data) and .TAB (engineering and MED data) files, organizing them into a
     hierarchical xarray DataTree structure.
 
     Args:
@@ -233,17 +270,21 @@ def load_ppdp(data_dir: str) -> xr.DataTree:
         xarray DataTree with structure:
             /
             ├── HF/
-            │   ├── science (Dataset with I/Q data)
-            │   └── engineering (Dataset with chirp params)
+            │   ├── science (Dataset with complex I/Q data)
+            │   ├── engineering (Dataset with chirp params, timing)
+            │   └── med (Dataset with mission data: altitude, position, etc.)
             ├── VHF_NEGX/
             │   ├── science
-            │   └── engineering
+            │   ├── engineering
+            │   └── med
             ├── VHF_POSX/
             │   ├── science
-            │   └── engineering
+            │   ├── engineering
+            │   └── med
             └── VHF_FULL/
                 ├── science
-                └── engineering
+                ├── engineering
+                └── med
 
     Example:
         >>> tree = load_ppdp("urn-nasa-pds-clipper.rea.partiallyprocessed/DATA/000MGA/2025060T1736")
@@ -251,8 +292,9 @@ def load_ppdp(data_dir: str) -> xr.DataTree:
         >>> hf_data = tree['HF/science'].ds
         >>> # Get complex I/Q data
         >>> complex_iq = hf_data['complex']
-        >>> # Calculate amplitude in dB
-        >>> amp_db = 20 * np.log10(np.abs(complex_iq) + 1e-10)
+        >>> # Access MED data for geometric correction
+        >>> hf_med = tree['HF/med'].ds
+        >>> altitude_km = hf_med['SC_altitude_above_target_ellipsoid'].values / 1000
     """
     data_path = Path(data_dir)
 
@@ -328,6 +370,29 @@ def load_ppdp(data_dir: str) -> xr.DataTree:
             print(f"Loading {channel_name} engineering data from {file_path.name}...")
             channels_data[channel_name]['engineering'] = _load_engineering_data(file_path)
 
+    # Load mission engineering data (MED) files (*MED*.TAB files)
+    for file_path in sorted(data_path.glob('*MED*.TAB')):
+        parsed = _parse_filename(file_path.name)
+        if not parsed:
+            continue
+
+        channel_key = parsed['channel']
+
+        # Determine channel name from filename
+        channel_name = None
+        if '09TCOMB' in channel_key.upper():
+            channel_name = 'HF'
+        elif '60TFULL' in channel_key.upper():
+            channel_name = 'VHF_FULL'
+        elif 'NEGX' in channel_key.upper():
+            channel_name = 'VHF_NEGX'
+        elif 'POSX' in channel_key.upper():
+            channel_name = 'VHF_POSX'
+
+        if channel_name and channel_name in channels_data:
+            print(f"Loading {channel_name} mission engineering data from {file_path.name}...")
+            channels_data[channel_name]['med'] = _load_engineering_data(file_path, is_med=True)
+
     # Build DataTree structure using from_dict
     tree_dict = {}
 
@@ -336,6 +401,8 @@ def load_ppdp(data_dir: str) -> xr.DataTree:
             tree_dict[f'{channel_name}/science'] = datasets['science']
         if 'engineering' in datasets:
             tree_dict[f'{channel_name}/engineering'] = datasets['engineering']
+        if 'med' in datasets:
+            tree_dict[f'{channel_name}/med'] = datasets['med']
 
     # Create root with metadata
     root_ds = xr.Dataset(attrs={

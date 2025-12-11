@@ -47,7 +47,7 @@ STACKING = {
 CHANNEL_ORDER = ['HF', 'VHF_POSX', 'VHF_FULL', 'VHF_NEGX']
 
 
-def process_channel(channel_name, science_ds, eng_ds, sample_rate, stack_factor):
+def process_channel(channel_name, science_ds, eng_ds, med_ds, sample_rate, stack_factor):
     """
     Process a single channel through all compression and alignment steps.
 
@@ -61,6 +61,8 @@ def process_channel(channel_name, science_ds, eng_ds, sample_rate, stack_factor)
         Science dataset containing complex I/Q data
     eng_ds : xr.Dataset
         Engineering dataset with chirp and timing parameters
+    med_ds : xr.Dataset
+        Mission engineering dataset with altitude and position data
     sample_rate : float
         Sample rate in Hz
     stack_factor : int
@@ -139,32 +141,84 @@ def process_channel(channel_name, science_ds, eng_ds, sample_rate, stack_factor)
                     eng_stacked[key] = eng_ds[key].values[dwell_indices]
 
         # Step 4: Align records within dwell by delay
-        try:
-            aligned = align_by_delay(
-                data=stacked,
-                hw_rx_opening_ticks=eng_stacked['HW_RX_opening_ticks'],
-                tx_start_ticks=eng_stacked['TX_start_ticks'],
-                chirp_length_ticks=eng_stacked['Chirp_length_ticks'],
-                rx_window_length_ticks=eng_stacked['RX_window_length_ticks'],
-                raw_active_mode_length=eng_stacked['Raw_active_mode_length'],
-                axis=0
-            )
-        except Exception as e:
-            print(f"    Warning: Delay alignment failed for dwell {dwell_id}: {e}")
-            aligned = stacked
+        # TODO: I couldn't get this to work. See notes in align_by_delay
+        # try:
+        #     aligned = align_by_delay(
+        #         data=stacked,
+        #         hw_rx_opening_ticks=eng_stacked['HW_RX_opening_ticks'],
+        #         tx_start_ticks=eng_stacked['TX_start_ticks'],
+        #         chirp_length_ticks=eng_stacked['Chirp_length_ticks'],
+        #         rx_window_length_ticks=eng_stacked['RX_window_length_ticks'],
+        #         raw_active_mode_length=eng_stacked['Raw_active_mode_length'],
+        #         sample_rate=sample_rate,
+        #         axis=0
+        #     )
+        # except Exception as e:
+        #     print(f"    Warning: Delay alignment failed for dwell {dwell_id}: {e}")
+        #     aligned = stacked
 
-        dwell_results.append(aligned)
+        #dwell_results.append(aligned)
+        dwell_results.append(stacked)
 
     # Concatenate all dwells
     print(f"  Concatenating {len(dwell_results)} dwells...")
     all_data = np.concatenate(dwell_results, axis=0)
     print(f"  Final shape after concatenation: {all_data.shape}")
 
-    # Step 5: Geometric correction (align to reference ellipsoid)
-    # Note: MED fields might not be available in this test data
-    # Would need to apply this after concatenating dwells
-    print(f"  Geometric correction: skipped (MED data not available in test dataset)")
-    geometrically_corrected = all_data
+    # Step 5: Geometric correction (align to reference altitude)
+    # Shift all records to a common reference altitude using MED data
+    if False and med_ds is not None and 'SC_altitude_above_target_ellipsoid' in med_ds.data_vars:
+        print(f"  Applying geometric correction...")
+
+        # Get altitude data (in meters)
+        altitude_m = med_ds['SC_altitude_above_target_ellipsoid'].values
+
+        # Stack altitude to match stacked data if stacking was applied
+        if stack_factor > 1:
+            # Take first value of each stack window to match stacked data
+            altitude_stacked = altitude_m[::stack_factor][:all_data.shape[0]]
+        else:
+            altitude_stacked = altitude_m[:all_data.shape[0]]
+
+        # Convert to km
+        altitude_km = altitude_stacked / 1000.0
+
+        # Reference altitude for alignment
+        # This aligns the top of the radargram to 3398 km altitude
+        reference_altitude_km = 3398.0
+
+        print(f"    Altitude range: {altitude_km.min():.1f} to {altitude_km.max():.1f} km")
+        print(f"    Reference altitude: {reference_altitude_km:.1f} km")
+
+        # Apply geometric correction using the library function
+        geometrically_corrected = geometric_correction(
+            data=all_data,
+            altitude_km=altitude_km,
+            sample_rate=sample_rate,
+            axis=0
+        )
+
+        # # Now shift to reference altitude
+        # # Calculate additional shift needed to align to reference altitude
+        # mean_altitude = altitude_km.mean()
+        # altitude_offset_km = reference_altitude_km - mean_altitude
+
+        # # Convert altitude offset to samples (two-way distance)
+        # c = 299792458  # Speed of light in m/s
+        # altitude_offset_m = altitude_offset_km * 1000
+        # range_offset_samples = (2 * altitude_offset_m) / (c / sample_rate)
+        # roll_amount = int(np.round(range_offset_samples))
+
+        # print(f"    Shifting to reference altitude: {roll_amount} samples")
+
+        # # Apply reference altitude shift to all records
+        # if roll_amount != 0:
+        #     geometrically_corrected = np.roll(geometrically_corrected, -roll_amount, axis=1)
+
+        print(f"    Geometric correction complete")
+    else:
+        print(f"  Geometric correction skipped")
+        geometrically_corrected = all_data
 
     # Step 6: Convert to amplitude in dB for visualization
     print(f"  Converting to amplitude (dB)...")
@@ -222,13 +276,18 @@ def main():
             print(f"Warning: No engineering data for {channel_name}, skipping")
             continue
 
+        # Get MED data if available
+        med = None
+        if 'med' in channel_node.children:
+            med = tree[f'{channel_name}/med'].ds
+
         # Process channel
         sample_rate = SAMPLE_RATES[channel_name]
         stack_factor = STACKING.get(channel_name, 1)
 
         try:
             amplitude_db = process_channel(
-                channel_name, science, engineering, sample_rate, stack_factor
+                channel_name, science, engineering, med, sample_rate, stack_factor
             )
             channel_data[channel_name] = {
                 'amplitude_db': amplitude_db,
